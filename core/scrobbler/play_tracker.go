@@ -5,6 +5,7 @@ import (
 	"maps"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/navidrome/navidrome/conf"
@@ -76,6 +77,7 @@ type playTracker struct {
 	npSignal          chan struct{}
 	shutdown          chan struct{}
 	workerDone        chan struct{}
+	stopped           atomic.Bool // Set to true when stopNowPlayingWorker is called
 }
 
 func GetPlayTracker(ds model.DataStore, broker events.Broker, pluginManager PluginLoader) PlayTracker {
@@ -105,6 +107,10 @@ func newPlayTracker(ds model.DataStore, broker events.Broker, pluginManager Plug
 	// Set up expiration callback for NowPlaying entries
 	// When a NowPlaying entry expires (track finished), finalize the session duration
 	m.OnExpiration(func(playerId string, info NowPlayingInfo) {
+		// Skip if the tracker has been stopped (prevents races during test cleanup)
+		if p.stopped.Load() {
+			return
+		}
 		if conf.Server.EnableNowPlaying {
 			broker.SendBroadcastMessage(context.Background(), &events.NowPlayingCount{Count: m.Len()})
 		}
@@ -130,6 +136,7 @@ func newPlayTracker(ds model.DataStore, broker events.Broker, pluginManager Plug
 
 // stopNowPlayingWorker stops the background worker. This is primarily for testing.
 func (p *playTracker) stopNowPlayingWorker() {
+	p.stopped.Store(true) // Prevent expiration callbacks from running
 	close(p.shutdown)
 	<-p.workerDone // Wait for worker to finish
 }
@@ -243,6 +250,11 @@ func (p *playTracker) finalizeSession(session *playSession) {
 
 // finalizeSessionOnExpiration is called when a NowPlaying entry expires.
 func (p *playTracker) finalizeSessionOnExpiration(playerID string, info NowPlayingInfo) {
+	// Skip if the tracker has been stopped
+	if p.stopped.Load() {
+		return
+	}
+
 	var sessionToFinalize *playSession
 
 	p.playSessionMu.Lock()
