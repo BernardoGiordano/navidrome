@@ -3,6 +3,7 @@ package model
 import "time"
 
 type Scrobble struct {
+	ID             string
 	MediaFileID    string
 	UserID         string
 	SubmissionTime time.Time
@@ -10,5 +11,8 @@ type Scrobble struct {
 }
 
 type ScrobbleRepository interface {
-	RecordScrobble(mediaFileID string, submissionTime time.Time, duration *int) error
+	// RecordScrobble creates a new scrobble record and returns its ID
+	RecordScrobble(mediaFileID string, submissionTime time.Time, duration *int) (string, error)
+	// UpdateDuration updates the duration of an existing scrobble
+	UpdateDuration(id string, duration int) error
 }
