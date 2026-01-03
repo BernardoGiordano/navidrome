@@ -215,6 +215,7 @@ func sessionKey(userID, playerID string) string {
 
 // finalizeSession calculates and updates the duration for a session's scrobble.
 // Called when a track changes or when NowPlaying expires.
+// NOTE: This should be called WITHOUT holding the playSessionMu lock since it makes DB calls.
 func (p *playTracker) finalizeSession(session *playSession) {
 	if session == nil || session.ScrobbleID == "" {
 		// No scrobble recorded yet, nothing to update
@@ -242,32 +243,38 @@ func (p *playTracker) finalizeSession(session *playSession) {
 
 // finalizeSessionOnExpiration is called when a NowPlaying entry expires.
 func (p *playTracker) finalizeSessionOnExpiration(playerID string, info NowPlayingInfo) {
-	p.playSessionMu.Lock()
-	defer p.playSessionMu.Unlock()
+	var sessionToFinalize *playSession
 
+	p.playSessionMu.Lock()
 	// Find session by iterating (we need to match by playerID which is part of the key)
 	for key, session := range p.playSessionMap {
 		// Check if this session matches the expired NowPlaying entry
 		if session.TrackID == info.MediaFile.ID && key == sessionKey(session.UserID, playerID) {
-			p.finalizeSession(session)
+			sessionToFinalize = session
 			delete(p.playSessionMap, key)
-			return
+			break
 		}
+	}
+	p.playSessionMu.Unlock()
+
+	// Finalize outside the lock to avoid holding it during DB operations
+	if sessionToFinalize != nil {
+		p.finalizeSession(sessionToFinalize)
 	}
 }
 
 // getOrCreateSession gets the current session for a user/player, finalizing any previous one if track changed.
 // Returns the session for the current track.
 func (p *playTracker) getOrCreateSession(userID, playerID, trackID string, start time.Time, position int) *playSession {
-	p.playSessionMu.Lock()
-	defer p.playSessionMu.Unlock()
+	var sessionToFinalize *playSession
 
+	p.playSessionMu.Lock()
 	key := sessionKey(userID, playerID)
 	existing := p.playSessionMap[key]
 
-	// If there's an existing session for a different track, finalize it
+	// If there's an existing session for a different track, mark it for finalization
 	if existing != nil && existing.TrackID != trackID {
-		p.finalizeSession(existing)
+		sessionToFinalize = existing
 		existing = nil
 	}
 
@@ -282,8 +289,15 @@ func (p *playTracker) getOrCreateSession(userID, playerID, trackID string, start
 		}
 		p.playSessionMap[key] = existing
 	}
+	result := existing
+	p.playSessionMu.Unlock()
 
-	return existing
+	// Finalize outside the lock to avoid holding it during DB operations
+	if sessionToFinalize != nil {
+		p.finalizeSession(sessionToFinalize)
+	}
+
+	return result
 }
 
 // setSessionScrobbleID sets the scrobble ID for an existing session.

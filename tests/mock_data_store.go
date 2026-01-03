@@ -28,6 +28,7 @@ type MockDataStore struct {
 	MockedScrobble       model.ScrobbleRepository
 	MockedRadio          model.RadioRepository
 	scrobbleBufferMu     sync.Mutex
+	scrobbleMu           sync.Mutex
 	repoMu               sync.Mutex
 
 	// GC tracking
@@ -216,6 +217,8 @@ func (db *MockDataStore) ScrobbleBuffer(ctx context.Context) model.ScrobbleBuffe
 }
 
 func (db *MockDataStore) Scrobble(ctx context.Context) model.ScrobbleRepository {
+	db.scrobbleMu.Lock()
+	defer db.scrobbleMu.Unlock()
 	if db.MockedScrobble == nil {
 		if db.RealDS != nil {
 			db.MockedScrobble = db.RealDS.Scrobble(ctx)
