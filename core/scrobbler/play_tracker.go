@@ -49,6 +49,16 @@ type playSession struct {
 	UserID     string    // User ID for DB operations
 }
 
+// duration calculates the elapsed listening time for this session.
+func (s *playSession) duration() int {
+	elapsed := int(time.Since(s.Start).Seconds())
+	duration := elapsed + s.Position
+	if duration < 0 {
+		duration = 0
+	}
+	return duration
+}
+
 type PlayTracker interface {
 	NowPlaying(ctx context.Context, playerId string, playerName string, trackId string, position int) error
 	GetNowPlaying(ctx context.Context) ([]NowPlayingInfo, error)
@@ -236,14 +246,7 @@ func (p *playTracker) finalizeSession(session *playSession) {
 		return
 	}
 
-	// Calculate duration: wall clock time elapsed + initial position
-	elapsed := int(time.Since(session.Start).Seconds())
-	duration := elapsed + session.Position
-
-	// Sanity check: duration should be positive
-	if duration < 0 {
-		duration = 0
-	}
+	duration := session.duration()
 
 	// Update the scrobble in the database
 	ctx := context.Background()
@@ -330,6 +333,21 @@ func (p *playTracker) setSessionScrobbleID(userID, playerID, trackID, scrobbleID
 	if session != nil && session.TrackID == trackID {
 		session.ScrobbleID = scrobbleID
 	}
+}
+
+// getSessionDuration returns the current duration (in seconds) for an active session.
+// Returns 0 if no session exists or if trackID doesn't match.
+func (p *playTracker) getSessionDuration(userID, playerID, trackID string) int {
+	p.playSessionMu.Lock()
+	defer p.playSessionMu.Unlock()
+
+	key := sessionKey(userID, playerID)
+	session := p.playSessionMap[key]
+	if session == nil || session.TrackID != trackID {
+		return 0
+	}
+
+	return session.duration()
 }
 
 func (p *playTracker) NowPlaying(ctx context.Context, playerId string, playerName string, trackId string, position int) error {
@@ -474,16 +492,24 @@ func (p *playTracker) Submit(ctx context.Context, submissions []Submission) erro
 			continue
 		}
 
-		// Create scrobble with NULL duration - it will be updated when playback ends
-		scrobbleID, err := p.incPlay(ctx, mf, s.Timestamp)
+		// Get initial duration from the active session (if any).
+		// This ensures we have a duration value even if the server restarts before TTL expires.
+		initialDuration := p.getSessionDuration(user.ID, playerID, s.TrackID)
+		var durationPtr *int
+		if initialDuration > 0 {
+			durationPtr = &initialDuration
+		}
+
+		// Create scrobble with initial duration from session
+		scrobbleID, err := p.incPlay(ctx, mf, s.Timestamp, durationPtr)
 		if err != nil {
 			log.Error(ctx, "Error updating play counts", "id", mf.ID, "track", mf.Title, "user", username, err)
 		} else {
 			success++
 			event.With("song", mf.ID).With("album", mf.AlbumID).With("artist", mf.AlbumArtistID)
-			log.Info(ctx, "Scrobbled", "title", mf.Title, "artist", mf.Artist, "user", username, "timestamp", s.Timestamp, "scrobbleID", scrobbleID)
+			log.Info(ctx, "Scrobbled", "title", mf.Title, "artist", mf.Artist, "user", username, "timestamp", s.Timestamp, "scrobbleID", scrobbleID, "initialDuration", initialDuration)
 
-			// Store the scrobble ID in the session so duration can be updated later
+			// Store the scrobble ID in the session so duration can be updated later when playback ends
 			if scrobbleID != "" {
 				p.setSessionScrobbleID(user.ID, playerID, s.TrackID, scrobbleID)
 			}
@@ -500,7 +526,7 @@ func (p *playTracker) Submit(ctx context.Context, submissions []Submission) erro
 	return nil
 }
 
-func (p *playTracker) incPlay(ctx context.Context, track *model.MediaFile, timestamp time.Time) (string, error) {
+func (p *playTracker) incPlay(ctx context.Context, track *model.MediaFile, timestamp time.Time, duration *int) (string, error) {
 	var scrobbleID string
 	err := p.ds.WithTx(func(tx model.DataStore) error {
 		err := tx.MediaFile(ctx).IncPlayCount(track.ID, timestamp)
@@ -518,8 +544,9 @@ func (p *playTracker) incPlay(ctx context.Context, track *model.MediaFile, times
 			}
 		}
 		if conf.Server.EnableScrobbleHistory {
-			// Create scrobble with NULL duration - will be updated when playback ends
-			scrobbleID, err = tx.Scrobble(ctx).RecordScrobble(track.ID, timestamp, nil)
+			// Create scrobble with initial duration from session.
+			// Duration may be updated later when playback ends (track change or TTL expiration).
+			scrobbleID, err = tx.Scrobble(ctx).RecordScrobble(track.ID, timestamp, duration)
 			return err
 		}
 		return nil
