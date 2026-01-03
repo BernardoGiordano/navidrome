@@ -68,6 +68,7 @@ type playTracker struct {
 	playMap           cache.SimpleCache[string, NowPlayingInfo]
 	playSessionMap    map[string]*playSession // key: userID:playerID
 	playSessionMu     sync.Mutex
+	enableNowPlaying  bool // Captured at creation time to avoid races with config changes
 	builtinScrobblers map[string]Scrobbler
 	pluginScrobblers  map[string]Scrobbler
 	pluginLoader      PluginLoader
@@ -90,10 +91,13 @@ func GetPlayTracker(ds model.DataStore, broker events.Broker, pluginManager Plug
 // the GetPlayTracker function above
 func newPlayTracker(ds model.DataStore, broker events.Broker, pluginManager PluginLoader) *playTracker {
 	m := cache.NewSimpleCache[string, NowPlayingInfo]()
+	// Capture config value at creation time to avoid races with config changes in tests
+	enableNowPlaying := conf.Server.EnableNowPlaying
 	p := &playTracker{
 		ds:                ds,
 		playMap:           m,
 		playSessionMap:    make(map[string]*playSession),
+		enableNowPlaying:  enableNowPlaying,
 		broker:            broker,
 		builtinScrobblers: make(map[string]Scrobbler),
 		pluginScrobblers:  make(map[string]Scrobbler),
@@ -106,12 +110,15 @@ func newPlayTracker(ds model.DataStore, broker events.Broker, pluginManager Plug
 
 	// Set up expiration callback for NowPlaying entries
 	// When a NowPlaying entry expires (track finished), finalize the session duration
+	// Note: We use p.enableNowPlaying (captured at creation) instead of conf.Server.EnableNowPlaying
+	// to avoid races with config changes during test cleanup. The callback runs in ttlcache's
+	// internal goroutine which we can't control.
 	m.OnExpiration(func(playerId string, info NowPlayingInfo) {
 		// Skip if the tracker has been stopped (prevents races during test cleanup)
 		if p.stopped.Load() {
 			return
 		}
-		if conf.Server.EnableNowPlaying {
+		if p.enableNowPlaying {
 			broker.SendBroadcastMessage(context.Background(), &events.NowPlayingCount{Count: m.Len()})
 		}
 		// Finalize the session when NowPlaying expires (track finished naturally)
