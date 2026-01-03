@@ -38,6 +38,13 @@ type nowPlayingEntry struct {
 	position int
 }
 
+// playSession tracks when a user started playing a specific track.
+// Used to calculate actual listening duration when a scrobble is submitted.
+type playSession struct {
+	Start    time.Time // When playback started (wall clock time)
+	Position int       // Position in seconds when playback started
+}
+
 type PlayTracker interface {
 	NowPlaying(ctx context.Context, playerId string, playerName string, trackId string, position int) error
 	GetNowPlaying(ctx context.Context) ([]NowPlayingInfo, error)
@@ -55,6 +62,8 @@ type playTracker struct {
 	ds                model.DataStore
 	broker            events.Broker
 	playMap           cache.SimpleCache[string, NowPlayingInfo]
+	playSessionMap    map[string]playSession // key: visitorID (userID + trackID)
+	playSessionMu     sync.RWMutex
 	builtinScrobblers map[string]Scrobbler
 	pluginScrobblers  map[string]Scrobbler
 	pluginLoader      PluginLoader
@@ -79,6 +88,7 @@ func newPlayTracker(ds model.DataStore, broker events.Broker, pluginManager Plug
 	p := &playTracker{
 		ds:                ds,
 		playMap:           m,
+		playSessionMap:    make(map[string]playSession),
 		broker:            broker,
 		builtinScrobblers: make(map[string]Scrobbler),
 		pluginScrobblers:  make(map[string]Scrobbler),
@@ -190,6 +200,47 @@ func (p *playTracker) getActiveScrobblers() map[string]Scrobbler {
 	return combined
 }
 
+// sessionKey generates a unique key for tracking play sessions per user/track combination.
+func sessionKey(userID, trackID string) string {
+	return userID + ":" + trackID
+}
+
+// recordPlaySession stores the start time and position for a play session.
+// This is called when NowPlaying is triggered.
+func (p *playTracker) recordPlaySession(userID, trackID string, start time.Time, position int) {
+	p.playSessionMu.Lock()
+	defer p.playSessionMu.Unlock()
+	p.playSessionMap[sessionKey(userID, trackID)] = playSession{
+		Start:    start,
+		Position: position,
+	}
+}
+
+// consumePlaySession retrieves and removes the play session for a user/track.
+// Returns the calculated duration in seconds and true if a session was found.
+// The duration is calculated as: (submitTime - startTime) + initialPosition
+func (p *playTracker) consumePlaySession(userID, trackID string, submitTime time.Time) (*int, bool) {
+	p.playSessionMu.Lock()
+	defer p.playSessionMu.Unlock()
+	key := sessionKey(userID, trackID)
+	session, found := p.playSessionMap[key]
+	if !found {
+		return nil, false
+	}
+	delete(p.playSessionMap, key)
+
+	// Calculate duration: wall clock time elapsed + initial position
+	elapsed := int(submitTime.Sub(session.Start).Seconds())
+	duration := elapsed + session.Position
+
+	// Sanity check: duration should be positive
+	if duration < 0 {
+		duration = 0
+	}
+
+	return &duration, true
+}
+
 func (p *playTracker) NowPlaying(ctx context.Context, playerId string, playerName string, trackId string, position int) error {
 	mf, err := p.ds.MediaFile(ctx).GetWithParticipants(trackId)
 	if err != nil {
@@ -219,6 +270,10 @@ func (p *playTracker) NowPlaying(ctx context.Context, playerId string, playerNam
 	if conf.Server.EnableNowPlaying {
 		p.broker.SendBroadcastMessage(ctx, &events.NowPlayingCount{Count: p.playMap.Len()})
 	}
+
+	// Record play session for duration tracking
+	p.recordPlaySession(user.ID, trackId, info.Start, position)
+
 	player, _ := request.PlayerFrom(ctx)
 	if player.ScrobbleEnabled {
 		p.enqueueNowPlaying(ctx, playerId, user.ID, mf, position)
@@ -304,6 +359,7 @@ func (p *playTracker) GetNowPlaying(_ context.Context) ([]NowPlayingInfo, error)
 
 func (p *playTracker) Submit(ctx context.Context, submissions []Submission) error {
 	username, _ := request.UsernameFrom(ctx)
+	user, _ := request.UserFrom(ctx)
 	player, _ := request.PlayerFrom(ctx)
 	if !player.ScrobbleEnabled {
 		log.Debug(ctx, "External scrobbling disabled for this player", "player", player.Name, "ip", player.IP, "user", username)
@@ -317,13 +373,27 @@ func (p *playTracker) Submit(ctx context.Context, submissions []Submission) erro
 			log.Error(ctx, "Cannot find track for scrobbling", "id", s.TrackID, "user", username, err)
 			continue
 		}
-		err = p.incPlay(ctx, mf, s.Timestamp)
+
+		// Try to get the actual listening duration from the play session
+		// We use time.Now() instead of s.Timestamp because s.Timestamp is the client-provided
+		// playback start time, not when the scrobble was submitted. We need the elapsed time
+		// between when the server received NowPlaying and when it received this scrobble.
+		duration, found := p.consumePlaySession(user.ID, s.TrackID, time.Now())
+		if !found {
+			log.Debug(ctx, "No play session found for scrobble, duration will be nil", "track", mf.Title, "user", username)
+		}
+
+		err = p.incPlay(ctx, mf, s.Timestamp, duration)
 		if err != nil {
 			log.Error(ctx, "Error updating play counts", "id", mf.ID, "track", mf.Title, "user", username, err)
 		} else {
 			success++
 			event.With("song", mf.ID).With("album", mf.AlbumID).With("artist", mf.AlbumArtistID)
-			log.Info(ctx, "Scrobbled", "title", mf.Title, "artist", mf.Artist, "user", username, "timestamp", s.Timestamp)
+			if duration != nil {
+				log.Info(ctx, "Scrobbled", "title", mf.Title, "artist", mf.Artist, "user", username, "timestamp", s.Timestamp, "duration", *duration)
+			} else {
+				log.Info(ctx, "Scrobbled", "title", mf.Title, "artist", mf.Artist, "user", username, "timestamp", s.Timestamp)
+			}
 			if player.ScrobbleEnabled {
 				p.dispatchScrobble(ctx, mf, s.Timestamp)
 			}
@@ -336,7 +406,7 @@ func (p *playTracker) Submit(ctx context.Context, submissions []Submission) erro
 	return nil
 }
 
-func (p *playTracker) incPlay(ctx context.Context, track *model.MediaFile, timestamp time.Time) error {
+func (p *playTracker) incPlay(ctx context.Context, track *model.MediaFile, timestamp time.Time, duration *int) error {
 	return p.ds.WithTx(func(tx model.DataStore) error {
 		err := tx.MediaFile(ctx).IncPlayCount(track.ID, timestamp)
 		if err != nil {
@@ -353,7 +423,7 @@ func (p *playTracker) incPlay(ctx context.Context, track *model.MediaFile, times
 			}
 		}
 		if conf.Server.EnableScrobbleHistory {
-			return tx.Scrobble(ctx).RecordScrobble(track.ID, timestamp)
+			return tx.Scrobble(ctx).RecordScrobble(track.ID, timestamp, duration)
 		}
 		return nil
 	})

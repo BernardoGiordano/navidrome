@@ -21,12 +21,13 @@ func NewScrobbleRepository(ctx context.Context, db dbx.Builder) model.ScrobbleRe
 	return r
 }
 
-func (r *scrobbleRepository) RecordScrobble(mediaFileID string, submissionTime time.Time) error {
+func (r *scrobbleRepository) RecordScrobble(mediaFileID string, submissionTime time.Time, duration *int) error {
 	userID := loggedUser(r.ctx).ID
 	values := map[string]interface{}{
 		"media_file_id":   mediaFileID,
 		"user_id":         userID,
 		"submission_time": submissionTime.Unix(),
+		"duration":        duration,
 	}
 	insert := Insert(r.tableName).SetMap(values)
 	_, err := r.executeSQL(insert)
