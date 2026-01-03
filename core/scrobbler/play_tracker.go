@@ -259,29 +259,25 @@ func (p *playTracker) finalizeSession(session *playSession) {
 }
 
 // finalizeSessionOnExpiration is called when a NowPlaying entry expires.
+// We only clean up the session here, but do NOT update the duration.
+// The TTL expiration doesn't mean the user listened until then - they may have
+// stopped earlier and closed the client. The initial duration set at scrobble time
+// is the most accurate value we have.
 func (p *playTracker) finalizeSessionOnExpiration(playerID string, info NowPlayingInfo) {
 	// Skip if the tracker has been stopped
 	if p.stopped.Load() {
 		return
 	}
 
-	var sessionToFinalize *playSession
-
 	p.playSessionMu.Lock()
-	// Find session by iterating (we need to match by playerID which is part of the key)
-	for key, session := range p.playSessionMap {
-		// Check if this session matches the expired NowPlaying entry
-		if session.TrackID == info.MediaFile.ID && key == sessionKey(session.UserID, playerID) {
-			sessionToFinalize = session
-			delete(p.playSessionMap, key)
-			break
-		}
-	}
-	p.playSessionMu.Unlock()
+	defer p.playSessionMu.Unlock()
 
-	// Finalize outside the lock to avoid holding it during DB operations
-	if sessionToFinalize != nil {
-		p.finalizeSession(sessionToFinalize)
+	// Find and delete session without updating duration
+	for key, session := range p.playSessionMap {
+		if session.TrackID == info.MediaFile.ID && key == sessionKey(session.UserID, playerID) {
+			delete(p.playSessionMap, key)
+			return
+		}
 	}
 }
 
