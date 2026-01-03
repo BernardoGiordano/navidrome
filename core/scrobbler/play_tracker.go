@@ -63,6 +63,9 @@ type PlayTracker interface {
 	NowPlaying(ctx context.Context, playerId string, playerName string, trackId string, position int) error
 	GetNowPlaying(ctx context.Context) ([]NowPlayingInfo, error)
 	Submit(ctx context.Context, submissions []Submission) error
+	// StopPlayback finalizes the duration for an active session when playback stops.
+	// The position parameter is the final playback position in seconds.
+	StopPlayback(ctx context.Context, trackId string, position int)
 }
 
 // PluginLoader is a minimal interface for plugin manager usage in PlayTracker
@@ -259,30 +262,45 @@ func (p *playTracker) finalizeSession(session *playSession) {
 }
 
 // finalizeSessionOnExpiration is called when a NowPlaying entry expires.
-// We only clean up the session here, but do NOT update the duration.
-// The TTL expiration doesn't mean the user listened until then - they may have
-// stopped earlier and closed the client. The initial duration set at scrobble time
-// is the most accurate value we have.
+// At TTL expiration, we can't know if the user kept listening or stopped earlier.
+// We use the last known Position as the duration since it's the most reliable data.
 func (p *playTracker) finalizeSessionOnExpiration(playerID string, info NowPlayingInfo) {
 	// Skip if the tracker has been stopped
 	if p.stopped.Load() {
 		return
 	}
 
-	p.playSessionMu.Lock()
-	defer p.playSessionMu.Unlock()
+	var scrobbleID string
+	var lastPosition int
 
-	// Find and delete session without updating duration
+	p.playSessionMu.Lock()
+	// Find session by iterating (we need to match by playerID which is part of the key)
 	for key, session := range p.playSessionMap {
+		// Check if this session matches the expired NowPlaying entry
 		if session.TrackID == info.MediaFile.ID && key == sessionKey(session.UserID, playerID) {
+			scrobbleID = session.ScrobbleID
+			lastPosition = session.Position
 			delete(p.playSessionMap, key)
-			return
+			break
+		}
+	}
+	p.playSessionMu.Unlock()
+
+	// Update duration using the last known position
+	if scrobbleID != "" {
+		ctx := context.Background()
+		err := p.ds.Scrobble(ctx).UpdateDuration(scrobbleID, lastPosition)
+		if err != nil {
+			log.Error(ctx, "Error updating scrobble duration on expiration", "scrobbleID", scrobbleID, "duration", lastPosition, err)
+		} else {
+			log.Debug(ctx, "Updated scrobble duration on expiration", "scrobbleID", scrobbleID, "duration", lastPosition, "trackID", info.MediaFile.ID)
 		}
 	}
 }
 
 // getOrCreateSession gets the current session for a user/player, finalizing any previous one if track changed.
 // Returns the session for the current track.
+// NOTE: For the same track, this updates Start and Position on every call to improve duration accuracy.
 func (p *playTracker) getOrCreateSession(userID, playerID, trackID string, start time.Time, position int) *playSession {
 	var sessionToFinalize *playSession
 
@@ -306,6 +324,13 @@ func (p *playTracker) getOrCreateSession(userID, playerID, trackID string, start
 			UserID:     userID,
 		}
 		p.playSessionMap[key] = existing
+	} else {
+		// Update Start and Position on every NowPlaying call for the same track.
+		// This improves duration accuracy: duration() = time.Since(Start) + Position
+		// gives us the latest client-reported position plus time since that report.
+		// This handles pauses correctly since Position reflects actual playback progress.
+		existing.Start = start
+		existing.Position = position
 	}
 	result := existing
 	p.playSessionMu.Unlock()
@@ -520,6 +545,49 @@ func (p *playTracker) Submit(ctx context.Context, submissions []Submission) erro
 		p.broker.SendMessage(ctx, event)
 	}
 	return nil
+}
+
+func (p *playTracker) StopPlayback(ctx context.Context, trackId string, position int) {
+	user, ok := request.UserFrom(ctx)
+	if !ok {
+		return
+	}
+
+	// Get player ID - same logic as Submit
+	player, _ := request.PlayerFrom(ctx)
+	playerID, ok := request.ClientUniqueIdFrom(ctx)
+	if !ok {
+		playerID = player.ID
+	}
+
+	var sessionToFinalize *playSession
+	var scrobbleID string
+
+	p.playSessionMu.Lock()
+	key := sessionKey(user.ID, playerID)
+	session := p.playSessionMap[key]
+	if session != nil && session.TrackID == trackId && session.ScrobbleID != "" {
+		scrobbleID = session.ScrobbleID
+		sessionToFinalize = session
+		delete(p.playSessionMap, key)
+	}
+	p.playSessionMu.Unlock()
+
+	// Update duration outside the lock
+	if sessionToFinalize != nil && scrobbleID != "" {
+		// Use the provided position as the final duration (more accurate than wall clock)
+		duration := position
+		if duration < 0 {
+			duration = 0
+		}
+
+		err := p.ds.Scrobble(ctx).UpdateDuration(scrobbleID, duration)
+		if err != nil {
+			log.Error(ctx, "Error updating scrobble duration on stop", "scrobbleID", scrobbleID, "duration", duration, err)
+		} else {
+			log.Debug(ctx, "Updated scrobble duration on stop", "scrobbleID", scrobbleID, "duration", duration, "trackID", trackId)
+		}
+	}
 }
 
 func (p *playTracker) incPlay(ctx context.Context, track *model.MediaFile, timestamp time.Time, duration *int) (string, error) {
